@@ -8,7 +8,6 @@ module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
   res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
 
-  // Handle OPTIONS request for CORS
   if (req.method === 'OPTIONS') {
     res.status(200).end();
     return;
@@ -28,15 +27,17 @@ module.exports = async (req, res) => {
   }
 
   try {
-    // Validate TikTok URL
     if (!isValidTikTokUrl(url)) {
       return res.status(400).json({ error: 'Invalid TikTok URL' });
     }
 
-    const videoData = await getTikTokVideo(url);
-    
-    if (!videoData || !videoData.downloadURL) {
-      return res.status(404).json({ error: 'Video not found or unavailable' });
+    // Try multiple methods
+    let videoData = await method1_DirectScrape(url);
+    if (!videoData) videoData = await method2_ExternalAPI(url);
+    if (!videoData) videoData = await method3_OpenAPI(url);
+
+    if (!videoData) {
+      return res.status(404).json({ error: 'Could not extract video from this URL' });
     }
 
     res.json({
@@ -60,105 +61,247 @@ function isValidTikTokUrl(url) {
     /https?:\/\/vm\.tiktok\.com\/[a-zA-Z0-9]+/,
     /https?:\/\/vt\.tiktok\.com\/[a-zA-Z0-9]+/
   ];
-  
   return tiktokPatterns.some(pattern => pattern.test(url));
 }
 
-async function getTikTokVideo(url) {
+// Method 1: Direct scraping with multiple techniques
+async function method1_DirectScrape(url) {
   try {
-    // First, try to get the video data from the page
     const response = await axios.get(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
         'Accept-Encoding': 'gzip, deflate, br',
         'DNT': '1',
         'Connection': 'keep-alive',
         'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Cache-Control': 'max-age=0'
       },
-      timeout: 10000
+      timeout: 15000
     });
 
-    const $ = cheerio.load(response.data);
-    
-    // Look for video URL in various possible locations
-    let videoUrl = null;
-    let title = 'TikTok Video';
-    let author = 'Unknown';
+    const html = response.data;
+    const $ = cheerio.load(html);
 
-    // Method 1: Look for JSON data in script tags
-    const scriptTags = $('script');
-    for (let i = 0; i < scriptTags.length; i++) {
-      const scriptContent = $(scriptTags[i]).html();
-      if (scriptContent && scriptContent.includes('videoData')) {
-        try {
-          // Extract JSON data
-          const jsonMatch = scriptContent.match(/\{"props":\s*\{[^}]+\}\}/);
-          if (jsonMatch) {
-            const jsonData = JSON.parse(jsonMatch[0]);
-            if (jsonData.props?.pageProps?.videoData?.itemInfos) {
-              const videoData = jsonData.props.pageProps.videoData.itemInfos;
-              videoUrl = videoData.video?.urls?.[0];
-              title = videoData.text || 'TikTok Video';
-              author = videoData.author?.uniqueId || 'Unknown';
-              break;
+    // Technique 1: Look for JSON data in script tags
+    const scripts = $('script');
+    for (let i = 0; i < scripts.length; i++) {
+      const scriptContent = $(scripts[i]).html();
+      if (!scriptContent) continue;
+
+      // Look for video data in various JSON structures
+      const patterns = [
+        /"downloadAddr":"([^"]+)"/,
+        /"playAddr":"([^"]+)"/,
+        /"video":{"url":"([^"]+)"/,
+        /"urls":\["([^"]+)"\]/,
+        /"videoUrl":"([^"]+)"/,
+        /"downloadUrl":"([^"]+)"/,
+      ];
+
+      for (const pattern of patterns) {
+        const match = scriptContent.match(pattern);
+        if (match && match[1]) {
+          let videoUrl = match[1].replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+          
+          if (videoUrl && !videoUrl.startsWith('http')) {
+            videoUrl = 'https:' + videoUrl;
+          }
+
+          if (videoUrl && videoUrl.includes('tiktokcdn')) {
+            return {
+              downloadURL: videoUrl,
+              title: extractTitle(html),
+              author: extractAuthor(html),
+              originalURL: url,
+              method: 'direct_scrape'
+            };
+          }
+        }
+      }
+
+      // Try to parse large JSON objects
+      try {
+        const jsonMatches = scriptContent.match(/\{.*"video".*\}/g);
+        if (jsonMatches) {
+          for (const jsonStr of jsonMatches) {
+            try {
+              const data = JSON.parse(jsonStr);
+              const videoUrl = findVideoUrlInObject(data);
+              if (videoUrl) {
+                return {
+                  downloadURL: videoUrl,
+                  title: extractTitle(html),
+                  author: extractAuthor(html),
+                  originalURL: url,
+                  method: 'json_parse'
+                };
+              }
+            } catch (e) {
+              // Continue if JSON parsing fails
             }
           }
-        } catch (e) {
-          console.log('JSON parsing failed, trying other methods');
         }
+      } catch (e) {
+        // Continue to next technique
       }
     }
 
-    // Method 2: Look for video URL in meta tags
-    if (!videoUrl) {
-      $('meta').each((i, meta) => {
-        const property = $(meta).attr('property');
-        const content = $(meta).attr('content');
-        
-        if (property === 'og:video' || property === 'og:video:url') {
-          videoUrl = content;
-        }
-        if (property === 'og:title') {
-          title = content;
-        }
-        if (property === 'og:description' && content.includes('@')) {
-          author = content.split('@')[1]?.split(' ')[0] || 'Unknown';
-        }
-      });
-    }
+    // Technique 2: Meta tags
+    const metaVideo = $('meta[property="og:video"]').attr('content') || 
+                     $('meta[property="og:video:url"]').attr('content') ||
+                     $('meta[name="twitter:player:stream"]').attr('content');
 
-    // Method 3: Look for video URL in the page source
-    if (!videoUrl) {
-      const html = response.data;
-      const videoRegex = /"downloadAddr":"([^"]+)"/;
-      const match = html.match(videoRegex);
-      if (match) {
-        videoUrl = match[1].replace(/\\u0026/g, '&');
-      }
-    }
-
-    if (videoUrl) {
-      // Ensure the URL is absolute
-      if (videoUrl.startsWith('//')) {
-        videoUrl = 'https:' + videoUrl;
-      } else if (videoUrl.startsWith('/')) {
-        videoUrl = 'https://www.tiktok.com' + videoUrl;
-      }
-
+    if (metaVideo && metaVideo.includes('tiktokcdn')) {
       return {
-        downloadURL: videoUrl,
-        title: title,
-        author: author,
-        originalURL: url
+        downloadURL: metaVideo,
+        title: $('meta[property="og:title"]').attr('content') || 'TikTok Video',
+        author: extractAuthor(html),
+        originalURL: url,
+        method: 'meta_tags'
       };
     }
 
-    throw new Error('Could not extract video URL');
-
   } catch (error) {
-    console.error('Error in getTikTokVideo:', error.message);
-    throw error;
+    console.log('Method 1 failed:', error.message);
   }
+  return null;
+}
+
+// Method 2: Use external API service
+async function method2_ExternalAPI(url) {
+  try {
+    const services = [
+      {
+        url: 'https://api.tiklydown.eu.org/api/download',
+        method: 'post',
+        data: { url: url }
+      },
+      {
+        url: `https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`,
+        method: 'get'
+      }
+    ];
+
+    for (const service of services) {
+      try {
+        const response = service.method === 'post' 
+          ? await axios.post(service.url, service.data, {
+              headers: {
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+              },
+              timeout: 10000
+            })
+          : await axios.get(service.url, {
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+              },
+              timeout: 10000
+            });
+
+        const data = response.data;
+        
+        // Parse different response formats
+        let videoUrl = null;
+        if (data.data && data.data.play) {
+          videoUrl = data.data.play;
+        } else if (data.video) {
+          videoUrl = data.video.noWatermark || data.video.withWatermark;
+        } else if (data.play) {
+          videoUrl = data.play;
+        }
+
+        if (videoUrl) {
+          return {
+            downloadURL: videoUrl.startsWith('http') ? videoUrl : `https://www.tikwm.com${videoUrl}`,
+            title: data.title || 'TikTok Video',
+            author: data.author?.nickname || data.author || 'Unknown',
+            originalURL: url,
+            method: 'external_api'
+          };
+        }
+      } catch (e) {
+        console.log(`Service ${service.url} failed:`, e.message);
+        continue;
+      }
+    }
+  } catch (error) {
+    console.log('Method 2 failed:', error.message);
+  }
+  return null;
+}
+
+// Method 3: Open APIs
+async function method3_OpenAPI(url) {
+  try {
+    const apis = [
+      `https://api.tiktokdownloadr.com/video?url=${encodeURIComponent(url)}`,
+      `https://tikdown.org/api?url=${encodeURIComponent(url)}`
+    ];
+
+    for (const apiUrl of apis) {
+      try {
+        const response = await axios.get(apiUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          },
+          timeout: 10000
+        });
+
+        const data = response.data;
+        if (data.video_url || data.download_url) {
+          return {
+            downloadURL: data.video_url || data.download_url,
+            title: data.title || 'TikTok Video',
+            author: data.author || 'Unknown',
+            originalURL: url,
+            method: 'open_api'
+          };
+        }
+      } catch (e) {
+        continue;
+      }
+    }
+  } catch (error) {
+    console.log('Method 3 failed:', error.message);
+  }
+  return null;
+}
+
+// Helper functions
+function findVideoUrlInObject(obj) {
+  if (typeof obj !== 'object' || obj === null) return null;
+  
+  for (let key in obj) {
+    if (typeof obj[key] === 'string' && obj[key].includes('tiktokcdn.com') && obj[key].includes('.mp4')) {
+      return obj[key].replace(/\\u0026/g, '&');
+    }
+    if (typeof obj[key] === 'object') {
+      const result = findVideoUrlInObject(obj[key]);
+      if (result) return result;
+    }
+  }
+  return null;
+}
+
+function extractTitle(html) {
+  const $ = cheerio.load(html);
+  return $('meta[property="og:title"]').attr('content') || 
+         $('title').text() || 
+         'TikTok Video';
+}
+
+function extractAuthor(html) {
+  const $ = cheerio.load(html);
+  const authorFromMeta = $('meta[property="og:description"]').attr('content');
+  if (authorFromMeta && authorFromMeta.includes('@')) {
+    const match = authorFromMeta.match(/@([^\s]+)/);
+    if (match) return match[1];
+  }
+  return 'Unknown';
 }
